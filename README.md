@@ -22,7 +22,7 @@
 ### Клонируйте репозиторий:
 ```bash
 git clone https://github.com/Shtyurts/WeatherBot.git
-cd weather-telegram-bot
+cd WeatherBot
 ```
 ### Установите зависимости:
 
