@@ -330,6 +330,7 @@ async def send_current_weather(data: dict, callback: types.CallbackQuery):
 
     current = data["list"][0]
     temp = current["main"].get("temp", "н/д")
+    humidity = current["main"].get("humidity", "н/д")  # Добавляем влажность
     desc = current["weather"][0].get("description", "н/д").capitalize()
     wind_speed = current["wind"].get("speed", "н/д")
     wind_deg = current["wind"].get("deg")
@@ -340,6 +341,7 @@ async def send_current_weather(data: dict, callback: types.CallbackQuery):
     await edit_or_resend(
         callback,
         f"🌡 Сейчас: {temp}°C\n"
+        f"💧 Влажность: {humidity}%\n"  # Новая строка
         f"🌪 Ветер: {wind_speed} м/с ({get_wind_direction(wind_deg)})\n"
         f"☁️ {desc}",
         builder.as_markup()
@@ -363,25 +365,31 @@ async def send_daily_forecast(data: dict, days: int, callback: types.CallbackQue
             for entry in daily_entries:
                 time = datetime.fromtimestamp(entry["dt"]).strftime("%H:%M")
                 temp = entry["main"]["temp"]
+                humidity = entry["main"].get("humidity", "н/д")  # Добавляем влажность
                 desc = entry["weather"][0]["description"].capitalize()
                 wind_speed = entry["wind"]["speed"]
                 wind_deg = entry["wind"].get("deg")
                 response.append(
-                    f"⏰ {time}: {temp}°C, {desc}\n"
-                    f"🌪 {wind_speed} м/с ({get_wind_direction(wind_deg)})"
+                    f"⏰ {time}:\n"
+                    f"  🌡 {temp}°C\n"
+                    f"  💧 {humidity}%\n"  # Новая строка
+                    f"  🌪 {wind_speed} м/с ({get_wind_direction(wind_deg)})\n"
+                    f"  ☁️ {desc}"
                 )
         else:
             temp_min = min(e["main"]["temp_min"] for e in daily_entries)
             temp_max = max(e["main"]["temp_max"] for e in daily_entries)
+            humidity_avg = round(sum(e["main"].get("humidity", 0) for e in daily_entries) / len(daily_entries))  # Средняя влажность
             wind_speeds = [e["wind"]["speed"] for e in daily_entries]
             wind_deg = daily_entries[0]["wind"].get("deg")
             desc = daily_entries[0]["weather"][0]["description"].capitalize()
             
             response.append(
                 f"📅 {day_name} ({date}):\n"
-                f"🌡 {temp_min}°C...{temp_max}°C\n"
-                f"🌪 Ветер: до {max(wind_speeds)} м/с ({get_wind_direction(wind_deg)})\n"
-                f"☁️ {desc}"
+                f"  🌡 {temp_min}°C...{temp_max}°C\n"
+                f"  💧 Влажность: ~{humidity_avg}%\n"  # Новая строка
+                f"  🌪 Ветер: до {max(wind_speeds)} м/с ({get_wind_direction(wind_deg)})\n"
+                f"  ☁️ {desc}"
             )
     
     builder = InlineKeyboardBuilder()
@@ -392,7 +400,7 @@ async def send_daily_forecast(data: dict, days: int, callback: types.CallbackQue
         "\n\n".join(response),
         builder.as_markup()
     )
-
+    
 async def on_startup():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
