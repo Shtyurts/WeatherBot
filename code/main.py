@@ -19,11 +19,13 @@ from collections import defaultdict
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
+# Глобальные словари для хранения состояния пользователя
 user_coords = {}
 current_actions = {}
 user_last_message = {}
 user_selected_places: Dict[int, List[Place]] = {}
 user_selected_days: Dict[int, Set[datetime.date]] = {}
+user_selected_hours: Dict[int, Set[str]] = {}
 
 def get_wind_direction(deg: float | None) -> str:
     directions = ["⬇️ С", "↘️ СВ", "➡️ В", "↗️ ЮВ", "⬆️ Ю", "↖️ ЮЗ", "⬅️ З", "↙️ СЗ"]
@@ -82,6 +84,7 @@ async def main_menu(callback: types.CallbackQuery):
     user_id = callback.from_user.id
     user_selected_places.pop(user_id, None)
     user_selected_days.pop(user_id, None)
+    user_selected_hours.pop(user_id, None)
     builder = await build_main_menu(callback.from_user.id)
     await edit_or_resend(callback, "🌤 Главное меню:", builder.as_markup())
 
@@ -129,21 +132,7 @@ async def cancel_location_request(message: types.Message):
     builder = await build_main_menu(user_id)
     msg = await message.answer("🌤 Главное меню:", reply_markup=builder.as_markup())
     user_last_message[user_id] = msg.message_id
-    
-async def edit_or_resend(callback: types.CallbackQuery, text: str, reply_markup: types.InlineKeyboardMarkup = None) -> None:
-    try:
-        # Пытаемся редактировать существующее сообщение
-        await callback.message.edit_text(text, reply_markup=reply_markup)
-        user_last_message[callback.from_user.id] = callback.message.message_id
-    except TelegramBadRequest as e:
-        # Если не получилось редактировать, отправляем новое сообщение
-        if "message is not modified" not in str(e):
-            new_msg = await callback.message.answer(text, reply_markup=reply_markup)
-            user_last_message[callback.from_user.id] = new_msg.message_id
-    finally:
-        await callback.answer()
-        
-        
+
 @dp.message(F.content_type == ContentType.LOCATION)
 async def handle_location(message: types.Message):
     user_id = message.from_user.id
@@ -267,8 +256,7 @@ async def start_comparison(callback: types.CallbackQuery):
         builder.as_markup()
     )
     user_selected_places[callback.from_user.id] = []
-    
-    
+
 @dp.callback_query(F.data.startswith("compare_place_"))
 async def toggle_place_selection(callback: types.CallbackQuery):
     place_id = int(callback.data.split("_")[-1])
@@ -298,7 +286,7 @@ async def toggle_place_selection(callback: types.CallbackQuery):
     await callback.message.edit_reply_markup(reply_markup=callback.message.reply_markup)
     user_selected_places[user_id] = selected_places
     await callback.answer()
-    
+
 @dp.callback_query(F.data == "compare_continue")
 async def select_days_for_comparison(callback: types.CallbackQuery):
     user_id = callback.from_user.id
@@ -326,7 +314,8 @@ async def select_days_for_comparison(callback: types.CallbackQuery):
                 callback_data=f"compare_day_{day.isoformat()}"
             )
         
-        builder.button(text="✅ Сравнить", callback_data="compare_execute")
+        # Кнопка перехода к выбору часов вместо немедленного сравнения
+        builder.button(text="✅ Далее", callback_data="compare_hours")
         builder.button(text="❌ Отмена", callback_data="main_menu")
         builder.adjust(2, 2, 1)
         
@@ -352,7 +341,7 @@ async def toggle_day_selection(callback: types.CallbackQuery):
     else:
         current_days.add(selected_date)
         new_text = f"◼ {get_day_name(selected_date)} ({selected_date.strftime('%d.%m')})"
-
+    
     keyboard = callback.message.reply_markup.inline_keyboard
     for row in keyboard:
         for btn in row:
@@ -363,14 +352,98 @@ async def toggle_day_selection(callback: types.CallbackQuery):
     user_selected_days[user_id] = current_days
     await callback.answer()
 
+@dp.callback_query(F.data == "compare_hours")
+async def select_hours_for_comparison(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    if len(user_selected_places.get(user_id, [])) < 2 or len(user_selected_days.get(user_id, set())) == 0:
+        await callback.answer("❌ Выберите минимум 2 места и хотя бы 1 день", show_alert=True)
+        return
+
+    default_hours = {"12:00", "15:00", "18:00"}
+    user_selected_hours[user_id] = default_hours.copy()
+    builder = InlineKeyboardBuilder()
+    hours_list = ["00:00", "03:00", "06:00", "09:00", "12:00", "15:00", "18:00", "21:00"]
+    for hour in hours_list:
+        if hour in default_hours:
+            text = f"◼ {hour}"
+        else:
+            text = f"▢ {hour}"
+        builder.button(text=text, callback_data=f"compare_hour_{hour}")
+    
+    builder.button(text="Выбрать все", callback_data="compare_hours_select_all")
+    builder.button(text="Снять все", callback_data="compare_hours_deselect_all")
+    builder.button(text="✅ Сравнить", callback_data="compare_execute")
+    builder.button(text="← Назад", callback_data="main_menu")
+    builder.adjust(4, 2)
+    
+    await edit_or_resend(
+         callback,
+         "Выберите время суток для сравнения:\n(Стандартно выбраны 12:00, 15:00, 18:00)",
+         builder.as_markup()
+    )
+
+@dp.callback_query(F.data.startswith("compare_hour_"))
+async def toggle_hour_selection(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    selected_hour = callback.data.split("_")[-1]
+    current_hours = user_selected_hours.get(user_id, set())
+    
+    if selected_hour in current_hours:
+        current_hours.remove(selected_hour)
+        new_text = f"▢ {selected_hour}"
+    else:
+        current_hours.add(selected_hour)
+        new_text = f"◼ {selected_hour}"
+    
+    keyboard = callback.message.reply_markup.inline_keyboard
+    for row in keyboard:
+        for btn in row:
+            if btn.callback_data == callback.data:
+                btn.text = new_text
+    
+    await callback.message.edit_reply_markup(reply_markup=callback.message.reply_markup)
+    user_selected_hours[user_id] = current_hours
+    await callback.answer()
+
+@dp.callback_query(F.data == "compare_hours_select_all")
+async def select_all_hours(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    hours_list = {"00:00", "03:00", "06:00", "09:00", "12:00", "15:00", "18:00", "21:00"}
+    user_selected_hours[user_id] = hours_list.copy()
+    keyboard = callback.message.reply_markup.inline_keyboard
+    for row in keyboard:
+        for btn in row:
+            if btn.callback_data and btn.callback_data.startswith("compare_hour_"):
+                hour = btn.callback_data.split("_")[-1]
+                btn.text = f"◼ {hour}"
+    await callback.message.edit_reply_markup(reply_markup=callback.message.reply_markup)
+    await callback.answer("Все часы выбраны")
+
+@dp.callback_query(F.data == "compare_hours_deselect_all")
+async def deselect_all_hours(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    user_selected_hours[user_id] = set()
+    keyboard = callback.message.reply_markup.inline_keyboard
+    for row in keyboard:
+        for btn in row:
+            if btn.callback_data and btn.callback_data.startswith("compare_hour_"):
+                hour = btn.callback_data.split("_")[-1]
+                btn.text = f"▢ {hour}"
+    await callback.message.edit_reply_markup(reply_markup=callback.message.reply_markup)
+    await callback.answer("Все часы сняты")
+
 @dp.callback_query(F.data == "compare_execute")
 async def execute_comparison(callback: types.CallbackQuery):
     user_id = callback.from_user.id
     places = user_selected_places.get(user_id, [])
     days = user_selected_days.get(user_id, set())
+    selected_hours = user_selected_hours.get(user_id, set())
     
     if len(places) < 2 or len(days) == 0:
         await callback.answer("❌ Выберите минимум 2 места и хотя бы 1 день", show_alert=True)
+        return
+    if len(selected_hours) == 0:
+        await callback.answer("❌ Выберите хотя бы один час", show_alert=True)
         return
 
     all_data = defaultdict(dict)
@@ -385,10 +458,10 @@ async def execute_comparison(callback: types.CallbackQuery):
             
             for item in data['list']:
                 date = datetime.fromtimestamp(item['dt']).date()
-                if date in days:
-                    time = datetime.fromtimestamp(item['dt']).strftime("%H:%M")
-                    all_data[date][time] = all_data[date].get(time, {})
-                    all_data[date][time][place.name] = {
+                time_str = datetime.fromtimestamp(item['dt']).strftime("%H:%M")
+                if date in days and time_str in selected_hours:
+                    all_data[date].setdefault(time_str, {})
+                    all_data[date][time_str][place.name] = {
                         'temp': item['main']['temp'],
                         'humidity': item['main']['humidity'],
                         'wind_speed': item['wind']['speed'],
@@ -426,13 +499,14 @@ async def execute_comparison(callback: types.CallbackQuery):
         )
     except TelegramBadRequest:
         await callback.message.answer(
-            "⚠️ Слишком большой объем данных для сравнения. Выберите меньше дней.",
+            "⚠️ Слишком большой объем данных для сравнения. Выберите меньше дней или часов.",
             reply_markup=builder.as_markup()
         )
     
     # Очищаем состояние
     user_selected_places.pop(user_id, None)
     user_selected_days.pop(user_id, None)
+    user_selected_hours.pop(user_id, None)
 
 @dp.callback_query(F.data == "delete_place")
 async def delete_place_start(callback: types.CallbackQuery):
@@ -532,7 +606,7 @@ async def send_current_weather(data: dict, callback: types.CallbackQuery):
 
     current = data["list"][0]
     temp = current["main"].get("temp", "н/д")
-    humidity = current["main"].get("humidity", "н/д")  # Добавляем влажность
+    humidity = current["main"].get("humidity", "н/д")
     desc = current["weather"][0].get("description", "н/д").capitalize()
     wind_speed = current["wind"].get("speed", "н/д")
     wind_deg = current["wind"].get("deg")
@@ -543,7 +617,7 @@ async def send_current_weather(data: dict, callback: types.CallbackQuery):
     await edit_or_resend(
         callback,
         f"🌡 Сейчас: {temp}°C\n"
-        f"💧 Влажность: {humidity}%\n"  # Новая строка
+        f"💧 Влажность: {humidity}%\n"
         f"🌪 Ветер: {wind_speed} м/с ({get_wind_direction(wind_deg)})\n"
         f"☁️ {desc}",
         builder.as_markup()
@@ -567,21 +641,21 @@ async def send_daily_forecast(data: dict, days: int, callback: types.CallbackQue
             for entry in daily_entries:
                 time = datetime.fromtimestamp(entry["dt"]).strftime("%H:%M")
                 temp = entry["main"]["temp"]
-                humidity = entry["main"].get("humidity", "н/д")  # Добавляем влажность
+                humidity = entry["main"].get("humidity", "н/д")
                 desc = entry["weather"][0]["description"].capitalize()
                 wind_speed = entry["wind"]["speed"]
                 wind_deg = entry["wind"].get("deg")
                 response.append(
                     f"⏰ {time}:\n"
                     f"  🌡 {temp}°C\n"
-                    f"  💧 {humidity}%\n"  # Новая строка
+                    f"  💧 {humidity}%\n"
                     f"  🌪 {wind_speed} м/с ({get_wind_direction(wind_deg)})\n"
                     f"  ☁️ {desc}"
                 )
         else:
             temp_min = min(e["main"]["temp_min"] for e in daily_entries)
             temp_max = max(e["main"]["temp_max"] for e in daily_entries)
-            humidity_avg = round(sum(e["main"].get("humidity", 0) for e in daily_entries) / len(daily_entries))  # Средняя влажность
+            humidity_avg = round(sum(e["main"].get("humidity", 0) for e in daily_entries) / len(daily_entries))
             wind_speeds = [e["wind"]["speed"] for e in daily_entries]
             wind_deg = daily_entries[0]["wind"].get("deg")
             desc = daily_entries[0]["weather"][0]["description"].capitalize()
@@ -589,7 +663,7 @@ async def send_daily_forecast(data: dict, days: int, callback: types.CallbackQue
             response.append(
                 f"📅 {day_name} ({date}):\n"
                 f"  🌡 {temp_min}°C...{temp_max}°C\n"
-                f"  💧 Влажность: ~{humidity_avg}%\n"  # Новая строка
+                f"  💧 Влажность: ~{humidity_avg}%\n"
                 f"  🌪 Ветер: до {max(wind_speeds)} м/с ({get_wind_direction(wind_deg)})\n"
                 f"  ☁️ {desc}"
             )
