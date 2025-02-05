@@ -13,7 +13,8 @@ from aiogram.exceptions import TelegramBadRequest
 from database.db import engine, async_session, create_tables
 from database.models import Base, Place
 from database.repository import UserRepository, PlaceRepository
-
+from typing import Dict, List, Set
+from collections import defaultdict
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
@@ -21,13 +22,16 @@ dp = Dispatcher()
 user_coords = {}
 current_actions = {}
 user_last_message = {}
+user_selected_places: Dict[int, List[Place]] = {}
+user_selected_days: Dict[int, Set[datetime.date]] = {}
 
 def get_wind_direction(deg: float | None) -> str:
     directions = ["⬇️ С", "↘️ СВ", "➡️ В", "↗️ ЮВ", "⬆️ Ю", "↖️ ЮЗ", "⬅️ З", "↙️ СЗ"]
     return directions[round(deg / 45) % 8] if deg else "н/д"
 
 def get_day_name(date: datetime.date) -> str:
-    days = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
+    days = ["Понедельник", "Вторник", "Среда", "Четверг", 
+           "Пятница", "Суббота", "Воскресенье"]
     return days[date.weekday()]
 
 async def build_main_menu(user_id: int) -> InlineKeyboardBuilder:
@@ -45,8 +49,9 @@ async def build_main_menu(user_id: int) -> InlineKeyboardBuilder:
         builder.button(text="➕ Добавить место", callback_data="add_place")
         builder.button(text="🗑️ Удалить место", callback_data="delete_place")
         builder.button(text="🌤 Текущее местоположение", callback_data="current_location")
+        builder.button(text="🔄 Сравнить места", callback_data="compare_start")
         
-    builder.adjust(1, 2, 1)
+    builder.adjust(1, 2, 1, 1)
     return builder
 
 async def edit_or_resend(callback: types.CallbackQuery, text: str, reply_markup: types.InlineKeyboardMarkup = None) -> None:
@@ -74,6 +79,9 @@ async def cmd_start(message: types.Message):
 
 @dp.callback_query(F.data == "main_menu")
 async def main_menu(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    user_selected_places.pop(user_id, None)
+    user_selected_days.pop(user_id, None)
     builder = await build_main_menu(callback.from_user.id)
     await edit_or_resend(callback, "🌤 Главное меню:", builder.as_markup())
 
@@ -231,6 +239,200 @@ async def select_place(callback: types.CallbackQuery):
             )
         else:
             await callback.answer("🚫 Это не ваше место!", show_alert=True)
+
+@dp.callback_query(F.data == "compare_start")
+async def start_comparison(callback: types.CallbackQuery):
+    async with async_session() as session:
+        user = await UserRepository.get_or_create(session, callback.from_user.id)
+        places = await PlaceRepository.get_all(session, user.id)
+    
+    if len(places) < 2:
+        await callback.answer("❌ Нужно минимум 2 места для сравнения", show_alert=True)
+        return
+    
+    builder = InlineKeyboardBuilder()
+    for place in places:
+        builder.button(
+            text=f"▢ {place.name}", 
+            callback_data=f"compare_place_{place.id}"
+        )
+    
+    builder.button(text="✅ Продолжить", callback_data="compare_continue")
+    builder.button(text="❌ Отмена", callback_data="main_menu")
+    builder.adjust(1, 2)
+    
+    await edit_or_resend(
+        callback,
+        "Выберите места для сравнения (минимум 2):",
+        builder.as_markup()
+    )
+    user_selected_places[callback.from_user.id] = []
+    
+    
+@dp.callback_query(F.data.startswith("compare_place_"))
+async def toggle_place_selection(callback: types.CallbackQuery):
+    place_id = int(callback.data.split("_")[-1])
+    user_id = callback.from_user.id
+    
+    async with async_session() as session:
+        place = await session.get(Place, place_id)
+        if not place or place.user_id != (await UserRepository.get_or_create(session, user_id)).id:
+            await callback.answer("❌ Ошибка выбора места")
+            return
+    
+    selected_places = user_selected_places.get(user_id, [])
+    
+    if place in selected_places:
+        selected_places.remove(place)
+        new_text = f"▢ {place.name}"
+    else:
+        selected_places.append(place)
+        new_text = f"◼ {place.name}"
+    
+    keyboard = callback.message.reply_markup.inline_keyboard
+    for row in keyboard:
+        for btn in row:
+            if btn.callback_data == callback.data:
+                btn.text = new_text
+    
+    await callback.message.edit_reply_markup(reply_markup=callback.message.reply_markup)
+    user_selected_places[user_id] = selected_places
+    await callback.answer()
+    
+@dp.callback_query(F.data == "compare_continue")
+async def select_days_for_comparison(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    if len(user_selected_places.get(user_id, [])) < 2:
+        await callback.answer("❌ Выберите минимум 2 места", show_alert=True)
+        return
+
+    sample_place = user_selected_places[user_id][0]
+    url = f"https://api.openweathermap.org/data/2.5/forecast?lat={sample_place.lat}&lon={sample_place.lon}&appid={API_KEY}"
+    
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as response:
+                data = await response.json()
+        
+        forecast_days = sorted({datetime.fromtimestamp(item['dt']).date() for item in data['list']})
+        max_days = min(len(forecast_days), 5)  # Ограничиваем 5 днями
+        
+        builder = InlineKeyboardBuilder()
+        for day in forecast_days[:max_days]:
+            day_name = get_day_name(day)
+            date_str = day.strftime("%d.%m")
+            builder.button(
+                text=f"▢ {day_name} ({date_str})", 
+                callback_data=f"compare_day_{day.isoformat()}"
+            )
+        
+        builder.button(text="✅ Сравнить", callback_data="compare_execute")
+        builder.button(text="❌ Отмена", callback_data="main_menu")
+        builder.adjust(2, 2, 1)
+        
+        await edit_or_resend(
+            callback,
+            "Выберите дни для сравнения:",
+            builder.as_markup()
+        )
+        user_selected_days[user_id] = set()
+        
+    except Exception as e:
+        await callback.answer("❌ Ошибка получения данных прогноза", show_alert=True)
+
+@dp.callback_query(F.data.startswith("compare_day_"))
+async def toggle_day_selection(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    selected_date = datetime.fromisoformat(callback.data.split("_")[-1]).date()
+    current_days = user_selected_days.get(user_id, set())
+    
+    if selected_date in current_days:
+        current_days.remove(selected_date)
+        new_text = f"▢ {get_day_name(selected_date)} ({selected_date.strftime('%d.%m')})"
+    else:
+        current_days.add(selected_date)
+        new_text = f"◼ {get_day_name(selected_date)} ({selected_date.strftime('%d.%m')})"
+
+    keyboard = callback.message.reply_markup.inline_keyboard
+    for row in keyboard:
+        for btn in row:
+            if btn.callback_data == callback.data:
+                btn.text = new_text
+    
+    await callback.message.edit_reply_markup(reply_markup=callback.message.reply_markup)
+    user_selected_days[user_id] = current_days
+    await callback.answer()
+
+@dp.callback_query(F.data == "compare_execute")
+async def execute_comparison(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+    places = user_selected_places.get(user_id, [])
+    days = user_selected_days.get(user_id, set())
+    
+    if len(places) < 2 or len(days) == 0:
+        await callback.answer("❌ Выберите минимум 2 места и хотя бы 1 день", show_alert=True)
+        return
+
+    all_data = defaultdict(dict)
+    
+    for place in places:
+        url = f"https://api.openweathermap.org/data/2.5/forecast?lat={place.lat}&lon={place.lon}&appid={API_KEY}&units=metric&lang=ru"
+        
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url) as response:
+                    data = await response.json()
+            
+            for item in data['list']:
+                date = datetime.fromtimestamp(item['dt']).date()
+                if date in days:
+                    time = datetime.fromtimestamp(item['dt']).strftime("%H:%M")
+                    all_data[date][time] = all_data[date].get(time, {})
+                    all_data[date][time][place.name] = {
+                        'temp': item['main']['temp'],
+                        'humidity': item['main']['humidity'],
+                        'wind_speed': item['wind']['speed'],
+                        'description': item['weather'][0]['description'].capitalize()
+                    }
+        
+        except Exception as e:
+            await callback.answer(f"❌ Ошибка получения данных для {place.name}", show_alert=True)
+            return
+
+    result = []
+    for date in sorted(days):
+        result.append(f"📅 {get_day_name(date)} ({date.strftime('%d.%m')}):")
+        
+        for time in sorted(all_data[date].keys()):
+            result.append(f"\n⏰ {time}:")
+            
+            for place_name, weather in all_data[date][time].items():
+                result.append(
+                    f"  🌍 {place_name}:\n"
+                    f"    🌡 {weather['temp']}°C | 💧 {weather['humidity']}%\n"
+                    f"    🌪 {weather['wind_speed']} м/с | ☁️ {weather['description']}"
+                )
+        
+        result.append("\n" + "─"*30)
+    
+    builder = InlineKeyboardBuilder()
+    builder.button(text="← Назад в меню", callback_data="main_menu")
+    
+    try:
+        await edit_or_resend(
+            callback,
+            "\n".join(result)[:4000],  # Ограничение Telegram на длину сообщения
+            builder.as_markup()
+        )
+    except TelegramBadRequest:
+        await callback.message.answer(
+            "⚠️ Слишком большой объем данных для сравнения. Выберите меньше дней.",
+            reply_markup=builder.as_markup()
+        )
+    
+    # Очищаем состояние
+    user_selected_places.pop(user_id, None)
+    user_selected_days.pop(user_id, None)
 
 @dp.callback_query(F.data == "delete_place")
 async def delete_place_start(callback: types.CallbackQuery):
